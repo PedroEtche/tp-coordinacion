@@ -1,6 +1,7 @@
 package sum
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -8,6 +9,8 @@ import (
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
+
+var NoClientIDError = errors.New("No client ID provided in message")
 
 type SumConfig struct {
 	Id                int
@@ -23,7 +26,8 @@ type SumConfig struct {
 type Sum struct {
 	inputQueue     middleware.Middleware
 	outputExchange middleware.Middleware
-	fruitItemMap   map[string]fruititem.FruitItem
+	fruitItemMap   map[string]map[string]fruititem.FruitItem
+	solvedQueries  map[string]bool
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -45,10 +49,13 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
+	fruitItemMap := make(map[string]map[string]fruititem.FruitItem)
+	solvedQueries := make(map[string]bool)
 	return &Sum{
 		inputQueue:     inputQueue,
 		outputExchange: outputExchange,
-		fruitItemMap:   map[string]fruititem.FruitItem{},
+		fruitItemMap:   fruitItemMap,
+		solvedQueries:  solvedQueries,
 	}, nil
 }
 
@@ -59,31 +66,45 @@ func (sum *Sum) Run() {
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
-
-	fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	queryID, clientID, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
+	// Si la query ya fue recibida antes, no la vuelvo a procesar
+	// Esto evita retransmiciones de RabbitMQ
+	if _, ok := sum.solvedQueries[queryID]; ok {
+		return
+	} else {
+		sum.solvedQueries[queryID] = true
+	}
+	defer ack() // TODO: Chequear cuando habria que mandar el ack a Rabbit
+
 	if isEof {
-		if err := sum.handleEndOfRecordMessage(); err != nil {
+		if err := sum.handleEndOfRecordMessage(clientID); err != nil {
 			slog.Error("While handling end of record message", "err", err)
 		}
 		return
 	}
 
-	if err := sum.handleDataMessage(fruitRecords); err != nil {
+	if err := sum.handleDataMessage(clientID, fruitRecords); err != nil {
 		slog.Error("While handling data message", "err", err)
 	}
 }
 
-func (sum *Sum) handleEndOfRecordMessage() error {
+func (sum *Sum) handleEndOfRecordMessage(clientID string) error {
 	slog.Info("Received End Of Records message")
-	for key := range sum.fruitItemMap {
-		fruitRecord := []fruititem.FruitItem{sum.fruitItemMap[key]}
-		message, err := inner.SerializeMessage(fruitRecord)
+
+	fruitMap, ok := sum.fruitItemMap[clientID]
+	if !ok {
+		slog.Debug("No records received for client", "clientID", clientID)
+		return NoClientIDError
+	}
+
+	for key := range fruitMap {
+		fruitRecord := []fruititem.FruitItem{fruitMap[key]}
+		message, err := inner.SerializeMessage(clientID, fruitRecord)
 		if err != nil {
 			slog.Debug("While serializing message", "err", err)
 			return err
@@ -95,7 +116,7 @@ func (sum *Sum) handleEndOfRecordMessage() error {
 	}
 
 	eofMessage := []fruititem.FruitItem{}
-	message, err := inner.SerializeMessage(eofMessage)
+	message, err := inner.SerializeMessage(clientID, eofMessage)
 	if err != nil {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err
@@ -107,13 +128,17 @@ func (sum *Sum) handleEndOfRecordMessage() error {
 	return nil
 }
 
-func (sum *Sum) handleDataMessage(fruitRecords []fruititem.FruitItem) error {
+func (sum *Sum) handleDataMessage(clientID string, fruitRecords []fruititem.FruitItem) error {
+	if _, ok := sum.fruitItemMap[clientID]; !ok {
+		sum.fruitItemMap[clientID] = make(map[string]fruititem.FruitItem)
+	}
+
 	for _, fruitRecord := range fruitRecords {
-		_, ok := sum.fruitItemMap[fruitRecord.Fruit]
+		_, ok := sum.fruitItemMap[clientID][fruitRecord.Fruit]
 		if ok {
-			sum.fruitItemMap[fruitRecord.Fruit] = sum.fruitItemMap[fruitRecord.Fruit].Sum(fruitRecord)
+			sum.fruitItemMap[clientID][fruitRecord.Fruit] = sum.fruitItemMap[clientID][fruitRecord.Fruit].Sum(fruitRecord)
 		} else {
-			sum.fruitItemMap[fruitRecord.Fruit] = fruitRecord
+			sum.fruitItemMap[clientID][fruitRecord.Fruit] = fruitRecord
 		}
 	}
 	return nil

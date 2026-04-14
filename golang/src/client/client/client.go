@@ -18,8 +18,10 @@ import (
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/external"
 )
 
-const connectionAttempts = 3
-const connectionAttemptsDelayMs = 300
+const (
+	connectionAttempts        = 3
+	connectionAttemptsDelayMs = 300
+)
 
 type ClientConfig struct {
 	ServerHost string
