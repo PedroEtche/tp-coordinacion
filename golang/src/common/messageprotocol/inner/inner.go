@@ -9,69 +9,103 @@ import (
 	"github.com/google/uuid"
 )
 
-type innerMessage struct {
-	QueryID  string        `json:"query_id"`
-	ClientID string        `json:"client_id"`
-	Records  []interface{} `json:"records"`
+type MsgType string
+
+const (
+	FruitRecord  MsgType = "fruit_record"
+	EndOfRecords MsgType = "eof"
+	NewSum       MsgType = "new_queue"
+)
+
+type Record struct {
+	Fruit  string `json:"fruit"`
+	Amount uint32 `json:"amount"`
 }
 
-func deserializeJson(message []byte) (innerMessage, error) {
-	var data innerMessage
-	if err := json.Unmarshal(message, &data); err != nil {
-		return innerMessage{}, err
-	}
-	return data, nil
+type InnerMessage struct {
+	QueryID  string   `json:"query_id"`
+	ClientID string   `json:"client_id"`
+	Records  []Record `json:"records"`
+	Type     MsgType  `json:"type"`
 }
 
-func SerializeMessage(clientID string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	records := []interface{}{}
-	for _, fruitRecord := range fruitRecords {
-		datum := []interface{}{
-			fruitRecord.Fruit,
-			fruitRecord.Amount,
-		}
-		records = append(records, datum)
+func SerializeFruitItems(clientID string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	records := make([]Record, 0, len(fruitRecords))
+	for _, fr := range fruitRecords {
+		records = append(records, Record{
+			Fruit:  fr.Fruit,
+			Amount: fr.Amount,
+		})
 	}
 
-	queryID := uuid.New().String()
-	innerMessage := innerMessage{QueryID: queryID, ClientID: clientID, Records: records}
+	msg := InnerMessage{
+		QueryID:  uuid.New().String(),
+		ClientID: clientID,
+		Records:  records,
+		Type:     FruitRecord,
+	}
 
-	body, err := json.Marshal(innerMessage)
+	body, err := json.Marshal(msg)
 	if err != nil {
 		return nil, err
 	}
-	message := middleware.Message{Body: string(body)}
 
-	return &message, nil
+	return &middleware.Message{Body: string(body)}, nil
 }
 
-// DeserializeMessage Retorna el id de la query, el id del cliente y un slice de FruitItems
-func DeserializeMessage(message *middleware.Message) (string, string, []fruititem.FruitItem, bool, error) {
-	data, err := deserializeJson([]byte((*message).Body))
+func SerializeEOF(clientID string) (*middleware.Message, error) {
+	msg := InnerMessage{
+		QueryID:  uuid.New().String(),
+		ClientID: clientID,
+		Records:  []Record{},
+		Type:     EndOfRecords,
+	}
+
+	body, err := json.Marshal(msg)
 	if err != nil {
-		return "", "", nil, false, err
+		return nil, err
 	}
 
-	fruitRecords := []fruititem.FruitItem{}
-	for _, datum := range data.Records {
-		fruitPair, ok := datum.([]interface{})
-		if !ok {
-			return "", "", nil, false, errors.New("Datum is not an array")
-		}
+	return &middleware.Message{Body: string(body)}, nil
+}
 
-		fruit, ok := fruitPair[0].(string)
-		if !ok {
-			return "", "", nil, false, errors.New("Datum is not a (fruit, amount) pair")
-		}
-
-		fruitAmount, ok := fruitPair[1].(float64)
-		if !ok {
-			return "", "", nil, false, errors.New("Datum is not a (fruit, amount) pair")
-		}
-
-		fruitRecord := fruititem.FruitItem{Fruit: fruit, Amount: uint32(fruitAmount)}
-		fruitRecords = append(fruitRecords, fruitRecord)
+func SerializeNewSum() (*middleware.Message, error) {
+	msg := InnerMessage{
+		QueryID:  uuid.New().String(),
+		ClientID: "",
+		Records:  []Record{},
+		Type:     NewSum,
 	}
 
-	return data.QueryID, data.ClientID, fruitRecords, len(fruitRecords) == 0, nil
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &middleware.Message{Body: string(body)}, nil
+}
+
+func DeserializeMessage(message *middleware.Message) (*InnerMessage, error) {
+	var msg InnerMessage
+
+	if err := json.Unmarshal([]byte(message.Body), &msg); err != nil {
+		return nil, err
+	}
+
+	if msg.Type == EndOfRecords && len(msg.Records) > 0 {
+		return nil, errors.New("EOF message should not contain records")
+	}
+
+	return &msg, nil
+}
+
+func (m *InnerMessage) ToFruitItems() []fruititem.FruitItem {
+	items := make([]fruititem.FruitItem, 0, len(m.Records))
+	for _, r := range m.Records {
+		items = append(items, fruititem.FruitItem{
+			Fruit:  r.Fruit,
+			Amount: r.Amount,
+		})
+	}
+	return items
 }
