@@ -16,6 +16,15 @@ logs:
 	docker compose -f docker-compose.yaml logs
 .PHONY: logs
 
+logs-no-rabbit:
+	@services=$$(docker compose -f docker-compose.yaml config --services | grep -v '^rabbitmq$$'); \
+	if [ -z "$$services" ]; then \
+		echo "No hay servicios (sin rabbitmq) para mostrar logs."; \
+	else \
+		docker compose -f docker-compose.yaml logs $$services; \
+	fi
+.PHONY: logs-no-rabbit
+
 test:
 	mkdir -p output
 	rm -f ./output/*

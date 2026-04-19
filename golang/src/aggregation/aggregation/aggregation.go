@@ -31,7 +31,7 @@ type Aggregation struct {
 	fruitItemMap      map[string]map[string]fruititem.FruitItem
 	clientSumsCounter map[string]int
 	topSize           int
-	activeSums        int
+	SumAmount         int
 	solvedQueries     map[string]bool
 }
 
@@ -55,7 +55,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange:     inputExchange,
 		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
 		topSize:           config.TopSize,
-		activeSums:        0,
+		SumAmount:         config.SumAmount,
 		clientSumsCounter: make(map[string]int),
 		solvedQueries:     map[string]bool{},
 	}, nil
@@ -74,22 +74,15 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 		return
 	}
 
-	// Si la query ya fue recibida antes, no la vuelvo a procesar
-	// Esto evita retransmiciones de RabbitMQ
-	if _, ok := aggregation.solvedQueries[innerMsg.QueryID]; ok {
+	if aggregation.queryAlredyReceived(innerMsg.ClientID, innerMsg.QueryID, innerMsg.Type, innerMsg.SumID) {
 		return
-	} else {
-		aggregation.solvedQueries[innerMsg.QueryID] = true
 	}
 
 	defer ack()
 
 	switch innerMsg.Type {
-	case inner.NewSum:
-		aggregation.activeSums += 1
-		slog.Info("Received announcement of new Sum Entity")
 	case inner.EndOfRecords:
-		if err := aggregation.handleEndOfRecordsMessage(innerMsg.ClientID); err != nil {
+		if err := aggregation.handleEndOfRecordsMessage(innerMsg); err != nil {
 			slog.Error("While handling end of record message", "err", err)
 		}
 	case inner.FruitRecord:
@@ -97,23 +90,25 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	}
 }
 
-func (aggregation *Aggregation) handleEndOfRecordsMessage(clientID string) error {
+func (aggregation *Aggregation) handleEndOfRecordsMessage(innerMsg *inner.InnerMessage) error {
 	slog.Info("Received End Of Records message")
 
-	if err := aggregation.clientHealthCheck(clientID); err != nil {
-		return err
+	if _, ok := aggregation.clientSumsCounter[innerMsg.ClientID]; !ok {
+		aggregation.clientSumsCounter[innerMsg.ClientID] = 0
 	}
 
-	aggregation.clientSumsCounter[clientID] += 1
+	aggregation.clientSumsCounter[innerMsg.ClientID] += 1
 
-	if aggregation.clientSumsCounter[clientID] != aggregation.activeSums {
-		slog.Info("Todavia se neceita mas registros del cliente antes de hacer el top")
+	if aggregation.clientSumsCounter[innerMsg.ClientID] != aggregation.SumAmount {
+		slog.Info("Waiting for more SUM results before creating TOP", "clientID", innerMsg.ClientID, "currentSums", aggregation.clientSumsCounter[innerMsg.ClientID], "expectedSums", aggregation.SumAmount)
 		return nil
 
 	}
 
-	fruitTopRecords := aggregation.buildFruitTop(clientID)
-	message, err := inner.SerializeFruitItems(clientID, fruitTopRecords)
+	fruitTopRecords := []fruititem.FruitItem{}
+	aggregation.buildFruitTop(innerMsg.ClientID, &fruitTopRecords)
+
+	message, err := inner.SerializeFruitItems(innerMsg.ClientID, innerMsg.QueryID+1, fruitTopRecords)
 	if err != nil {
 		slog.Debug("While serializing top message", "err", err)
 		return err
@@ -123,18 +118,8 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(clientID string) error
 		return err
 	}
 
-	return nil
-}
+	// aggregation.clearClientState(innerMsg.ClientID)
 
-func (aggregation *Aggregation) clientHealthCheck(clientID string) error {
-	if _, ok := aggregation.clientSumsCounter[clientID]; !ok {
-		slog.Debug("Client has no register", "clientID", clientID)
-		return NoClientIDError
-	}
-	if _, ok := aggregation.fruitItemMap[clientID]; !ok {
-		slog.Debug("No records received for client", "clientID", clientID)
-		return NoClientIDError
-	}
 	return nil
 }
 
@@ -153,10 +138,17 @@ func (aggregation *Aggregation) handleDataMessage(clientID string, fruitRecords 
 	}
 }
 
-func (aggregation *Aggregation) buildFruitTop(clientID string) []fruititem.FruitItem {
+func (aggregation *Aggregation) buildFruitTop(clientID string, fruitTopRecords *[]fruititem.FruitItem) {
+	clientFruitMap, ok := aggregation.fruitItemMap[clientID]
+	if !ok {
+		slog.Info("No records received for client; publishing empty TOP", "clientID", clientID)
+		*fruitTopRecords = []fruititem.FruitItem{}
+		return
+	}
+
 	slog.Info("Creating Fruit TOP")
-	fruitItems := make([]fruititem.FruitItem, 0, len(aggregation.fruitItemMap[clientID]))
-	for _, item := range aggregation.fruitItemMap[clientID] {
+	fruitItems := make([]fruititem.FruitItem, 0, len(clientFruitMap))
+	for _, item := range clientFruitMap {
 		fruitItems = append(fruitItems, item)
 	}
 	sort.SliceStable(fruitItems, func(i, j int) bool {
@@ -164,5 +156,31 @@ func (aggregation *Aggregation) buildFruitTop(clientID string) []fruititem.Fruit
 	})
 	// NOTE: Esto probablemente seria mas eficiente usando un algoritmo Top K
 	finalTopSize := min(aggregation.topSize, len(fruitItems))
-	return fruitItems[:finalTopSize]
+	*fruitTopRecords = fruitItems[:finalTopSize]
+}
+
+func (aggregation *Aggregation) queryAlredyReceived(clientID string, queryID uint32, msgType inner.MsgType, sumID int) bool {
+	queryKey := fmt.Sprintf("%s_%d_%s_%d", clientID, queryID, msgType, sumID)
+
+	// Si la query ya fue recibida antes, no la vuelvo a procesar
+	// Esto evita retransmiciones de RabbitMQ
+	if _, ok := aggregation.solvedQueries[queryKey]; ok {
+		return true
+	} else {
+		aggregation.solvedQueries[queryKey] = true
+	}
+
+	return false
+}
+
+func (aggregation *Aggregation) clearClientState(clientID string) {
+	delete(aggregation.fruitItemMap, clientID)
+	delete(aggregation.clientSumsCounter, clientID)
+
+	prefix := fmt.Sprintf("%s_", clientID)
+	for key := range aggregation.solvedQueries {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			delete(aggregation.solvedQueries, key)
+		}
+	}
 }

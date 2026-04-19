@@ -6,15 +6,15 @@ import (
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
-	"github.com/google/uuid"
 )
 
 type MsgType string
 
 const (
-	FruitRecord  MsgType = "fruit_record"
-	EndOfRecords MsgType = "eof"
-	NewSum       MsgType = "new_queue"
+	FruitRecord       MsgType = "fruit_record"
+	EndOfRecords      MsgType = "eof"
+	SafeToFlush       MsgType = "flush"
+	SumQueryProcessed MsgType = "sum_query_processed"
 )
 
 type Record struct {
@@ -23,23 +23,18 @@ type Record struct {
 }
 
 type InnerMessage struct {
-	QueryID  string   `json:"query_id"`
+	QueryID  uint32   `json:"query_id"`
 	ClientID string   `json:"client_id"`
+	SumID    int      `json:"sum_id,omitempty"`
 	Records  []Record `json:"records"`
 	Type     MsgType  `json:"type"`
 }
 
-func SerializeFruitItems(clientID string, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	records := make([]Record, 0, len(fruitRecords))
-	for _, fr := range fruitRecords {
-		records = append(records, Record{
-			Fruit:  fr.Fruit,
-			Amount: fr.Amount,
-		})
-	}
+func SerializeFruitItems(clientID string, queryID uint32, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	records := createRecords(fruitRecords)
 
 	msg := InnerMessage{
-		QueryID:  uuid.New().String(),
+		QueryID:  queryID,
 		ClientID: clientID,
 		Records:  records,
 		Type:     FruitRecord,
@@ -53,9 +48,28 @@ func SerializeFruitItems(clientID string, fruitRecords []fruititem.FruitItem) (*
 	return &middleware.Message{Body: string(body)}, nil
 }
 
-func SerializeEOF(clientID string) (*middleware.Message, error) {
+func SerializeFruitItemsFromSum(clientID string, queryID uint32, sumID int, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	records := createRecords(fruitRecords)
+
 	msg := InnerMessage{
-		QueryID:  uuid.New().String(),
+		QueryID:  queryID,
+		ClientID: clientID,
+		SumID:    sumID,
+		Records:  records,
+		Type:     FruitRecord,
+	}
+
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &middleware.Message{Body: string(body)}, nil
+}
+
+func SerializeEOF(clientID string, queryID uint32) (*middleware.Message, error) {
+	msg := InnerMessage{
+		QueryID:  queryID,
 		ClientID: clientID,
 		Records:  []Record{},
 		Type:     EndOfRecords,
@@ -69,12 +83,45 @@ func SerializeEOF(clientID string) (*middleware.Message, error) {
 	return &middleware.Message{Body: string(body)}, nil
 }
 
-func SerializeNewSum() (*middleware.Message, error) {
+func SerializeEOFFromSum(clientID string, queryID uint32, sumID int) (*middleware.Message, error) {
 	msg := InnerMessage{
-		QueryID:  uuid.New().String(),
-		ClientID: "",
+		QueryID:  queryID,
+		ClientID: clientID,
+		SumID:    sumID,
 		Records:  []Record{},
-		Type:     NewSum,
+		Type:     EndOfRecords,
+	}
+
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &middleware.Message{Body: string(body)}, nil
+}
+
+func SerializeQueryProcessed(clientID string, queryID uint32) (*middleware.Message, error) {
+	msg := InnerMessage{
+		QueryID:  queryID,
+		ClientID: clientID,
+		Records:  []Record{},
+		Type:     SumQueryProcessed,
+	}
+
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &middleware.Message{Body: string(body)}, nil
+}
+
+func SerializeSafeToFlush(clientID string, queryID uint32) (*middleware.Message, error) {
+	msg := InnerMessage{
+		QueryID:  queryID,
+		ClientID: clientID,
+		Records:  []Record{},
+		Type:     SafeToFlush,
 	}
 
 	body, err := json.Marshal(msg)
@@ -108,4 +155,19 @@ func (m *InnerMessage) ToFruitItems() []fruititem.FruitItem {
 		})
 	}
 	return items
+}
+
+// -----------------------------
+// HELPERS
+// -----------------------------
+
+func createRecords(fruitRecords []fruititem.FruitItem) []Record {
+	records := make([]Record, 0, len(fruitRecords))
+	for _, fr := range fruitRecords {
+		records = append(records, Record{
+			Fruit:  fr.Fruit,
+			Amount: fr.Amount,
+		})
+	}
+	return records
 }
