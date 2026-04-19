@@ -3,6 +3,7 @@ package aggregation
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sort"
 
@@ -32,6 +33,8 @@ type Aggregation struct {
 	clientSumsCounter map[string]int
 	topSize           int
 	SumAmount         int
+	aggregationAmount int
+	id                int
 	solvedQueries     map[string]bool
 }
 
@@ -56,6 +59,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
 		topSize:           config.TopSize,
 		SumAmount:         config.SumAmount,
+		aggregationAmount: config.AggregationAmount,
+		id:                config.Id,
 		clientSumsCounter: make(map[string]int),
 		solvedQueries:     map[string]bool{},
 	}, nil
@@ -73,12 +78,15 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
+	defer ack()
+
+	if !aggregation.shouldProcessClient(innerMsg.ClientID) {
+		return
+	}
 
 	if aggregation.queryAlredyReceived(innerMsg.ClientID, innerMsg.QueryID, innerMsg.Type, innerMsg.SumID) {
 		return
 	}
-
-	defer ack()
 
 	switch innerMsg.Type {
 	case inner.EndOfRecords:
@@ -88,6 +96,17 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	case inner.FruitRecord:
 		aggregation.handleDataMessage(innerMsg.ClientID, innerMsg.ToFruitItems())
 	}
+}
+
+func (aggregation *Aggregation) shouldProcessClient(clientID string) bool {
+	if aggregation.aggregationAmount <= 1 {
+		return true
+	}
+
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(clientID))
+	targetID := int(h.Sum32() % uint32(aggregation.aggregationAmount))
+	return targetID == aggregation.id
 }
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(innerMsg *inner.InnerMessage) error {
