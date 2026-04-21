@@ -4,10 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"sync"
-
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common"
-	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
 )
@@ -24,14 +21,12 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	Id                  int
-	inputQueue          middleware.Middleware
-	aggregationExchange middleware.Middleware
-	joinOutputQueue     middleware.Middleware
-	joinInputExchange   middleware.Middleware
-	fruitItemMap        map[string]map[string]fruititem.FruitItem
-	fruitItemMapMu      sync.RWMutex
-	solvedQueries       sync.Map // map[string]bool,
+	Id                int
+	inputQueue        middleware.Middleware
+	joinInputExchange middleware.Middleware
+	processedTracker  *common.Tracker
+	store             *clientFruitStore
+	publisher         *sumPublisher
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -68,14 +63,15 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
+	publisher := newSumPublisher(config.Id, joinOutoutQueue, outputExchange)
+
 	return &Sum{
-		Id:                  config.Id,
-		inputQueue:          inputQueue,
-		aggregationExchange: outputExchange,
-		joinOutputQueue:     joinOutoutQueue,
-		joinInputExchange:   joinInputExchange,
-		fruitItemMap:        map[string]map[string]fruititem.FruitItem{},
-		solvedQueries:       sync.Map{},
+		Id:                config.Id,
+		inputQueue:        inputQueue,
+		joinInputExchange: joinInputExchange,
+		processedTracker:  common.NewTracker(),
+		store:             newClientFruitStore(),
+		publisher:         publisher,
 	}, nil
 }
 
@@ -104,12 +100,12 @@ func (sum *Sum) handleClientInputMessage(msg middleware.Message, ack func(), nac
 		return
 	}
 
-	if sum.queryAlredyReceived(innerMsg.ClientID, innerMsg.QueryID, innerMsg.Type) {
+	if sum.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), nil) {
 		return
 	}
 
 	if innerMsg.Type == inner.EndOfRecords {
-		if err := sum.publishClientEofAnnouncement(innerMsg.ClientID, innerMsg.QueryID); err != nil {
+		if err := sum.publisher.PublishClientEOFAnnouncement(innerMsg.ClientID, innerMsg.QueryID); err != nil {
 			slog.Error("While handling end of record message", "err", err)
 		}
 		return
@@ -121,49 +117,8 @@ func (sum *Sum) handleClientInputMessage(msg middleware.Message, ack func(), nac
 }
 
 func (sum *Sum) handleDataMessage(innerMsg *inner.InnerMessage) error {
-	sum.fruitItemMapMu.Lock()
-	defer sum.fruitItemMapMu.Unlock()
-
-	if _, ok := sum.fruitItemMap[innerMsg.ClientID]; !ok {
-		sum.fruitItemMap[innerMsg.ClientID] = make(map[string]fruititem.FruitItem)
-	}
-
-	for _, fruitRecord := range innerMsg.ToFruitItems() {
-		_, ok := sum.fruitItemMap[innerMsg.ClientID][fruitRecord.Fruit]
-		if ok {
-			sum.fruitItemMap[innerMsg.ClientID][fruitRecord.Fruit] = sum.fruitItemMap[innerMsg.ClientID][fruitRecord.Fruit].Sum(fruitRecord)
-		} else {
-			sum.fruitItemMap[innerMsg.ClientID][fruitRecord.Fruit] = fruitRecord
-		}
-	}
-
-	msg, err := inner.SerializeQueryProcessed(innerMsg.ClientID, innerMsg.QueryID)
-	if err != nil {
-		return err
-	}
-
-	if err := sum.joinOutputQueue.Send(*msg); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (sum *Sum) publishClientEofAnnouncement(clientID string, queryID uint32) error {
-	slog.Info("Received End Of Records message")
-
-	message, err := inner.SerializeEOF(clientID, queryID)
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-
-	if err := sum.joinOutputQueue.Send(*message); err != nil {
-		slog.Debug("While sending EOF message to JOIN", "err", err)
-		return err
-	}
-
-	return nil
+	sum.store.Add(innerMsg.ClientID, innerMsg.ToFruitItems())
+	return sum.publisher.PublishQueryProcessed(innerMsg.ClientID, innerMsg.QueryID)
 }
 
 // -----------------------------------------------------------------------------
@@ -186,7 +141,7 @@ func (sum *Sum) handleEofCoordinationMessage(msg middleware.Message, ack func(),
 
 	// Si la query ya fue recibida antes, no la vuelvo a procesar
 	// Esto evita retransmiciones de RabbitMQ
-	if sum.queryAlredyReceived(innerMsg.ClientID, innerMsg.QueryID, innerMsg.Type) {
+	if sum.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), nil) {
 		return
 	}
 
@@ -203,49 +158,21 @@ func (sum *Sum) handleEofCoordinationMessage(msg middleware.Message, ack func(),
 func (sum *Sum) flushClientDataOnEof(clientID string, queryID uint32) error {
 	slog.Info("Received End Of Records message")
 
-	sum.fruitItemMapMu.RLock()
-	fruitMap, ok := sum.fruitItemMap[clientID]
-	fruitItems := make([]fruititem.FruitItem, 0, len(fruitMap))
-	if ok {
-		for _, item := range fruitMap {
-			fruitItems = append(fruitItems, item)
-		}
-	}
-	sum.fruitItemMapMu.RUnlock()
+	fruitItems, ok := sum.store.GetClientRecords(clientID)
 
 	if !ok {
 		slog.Info("No records received for client", "clientID", clientID)
-		return sum.sendoEofToOutputExchange(clientID, queryID)
+		return sum.publisher.PublishEOF(clientID, queryID)
 	}
 
-	message, err := inner.SerializeFruitItemsFromSum(clientID, queryID, sum.Id, fruitItems)
-	if err != nil {
-		slog.Debug("While serializing message", "err", err)
-		return err
-	}
-	if err := sum.aggregationExchange.Send(*message); err != nil {
-		slog.Debug("While sending message", "err", err)
+	if err := sum.publisher.PublishFruitItems(clientID, queryID, fruitItems); err != nil {
 		return err
 	}
 
-	if err := sum.sendoEofToOutputExchange(clientID, queryID); err != nil {
+	if err := sum.publisher.PublishEOF(clientID, queryID); err != nil {
 		return err
 	}
 
-	// sum.clearClientState(clientID)
-	return nil
-}
-
-func (sum *Sum) sendoEofToOutputExchange(clientID string, queryID uint32) error {
-	message, err := inner.SerializeEOFFromSum(clientID, queryID, sum.Id)
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-	if err := sum.aggregationExchange.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
-	}
 	return nil
 }
 
@@ -253,30 +180,7 @@ func (sum *Sum) sendoEofToOutputExchange(clientID string, queryID uint32) error 
 // HELPERS
 // -----------------------------------------------------------------------------
 
-func (sum *Sum) queryAlredyReceived(clientID string, queryID uint32, msgType inner.MsgType) bool {
-	queryKey := fmt.Sprintf("%s_%d_%s", clientID, queryID, msgType)
-
-	// Si la query ya fue recibida antes, no la vuelvo a procesar
-	// Esto evita retransmiciones de RabbitMQ
-	if _, ok := sum.solvedQueries.Load(queryKey); ok {
-		return true
-	} else {
-		sum.solvedQueries.Store(queryKey, true)
-	}
-	return false
-}
-
 func (sum *Sum) clearClientState(clientID string) {
-	sum.fruitItemMapMu.Lock()
-	delete(sum.fruitItemMap, clientID)
-	sum.fruitItemMapMu.Unlock()
-
-	prefix := fmt.Sprintf("%s_", clientID)
-	sum.solvedQueries.Range(func(key, _ any) bool {
-		keyStr, ok := key.(string)
-		if ok && len(keyStr) >= len(prefix) && keyStr[:len(prefix)] == prefix {
-			sum.solvedQueries.Delete(keyStr)
-		}
-		return true
-	})
+	sum.store.Clear(clientID)
+	sum.processedTracker.DeleteByClient(clientID)
 }

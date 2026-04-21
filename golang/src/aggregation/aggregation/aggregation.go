@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"sort"
 
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
@@ -27,15 +27,12 @@ type AggregationConfig struct {
 }
 
 type Aggregation struct {
-	outputQueue       middleware.Middleware
 	inputExchange     middleware.Middleware
-	fruitItemMap      map[string]map[string]fruititem.FruitItem
-	clientSumsCounter map[string]int
-	topSize           int
-	SumAmount         int
 	aggregationAmount int
 	id                int
-	solvedQueries     map[string]bool
+	processedTracker  *common.Tracker
+	stateStore        *clientAggregationStore
+	publisher         *aggregationPublisher
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -53,16 +50,15 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		return nil, err
 	}
 
+	publisher := newAggregationPublisher(outputQueue)
+
 	return &Aggregation{
-		outputQueue:       outputQueue,
 		inputExchange:     inputExchange,
-		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
-		topSize:           config.TopSize,
-		SumAmount:         config.SumAmount,
 		aggregationAmount: config.AggregationAmount,
 		id:                config.Id,
-		clientSumsCounter: make(map[string]int),
-		solvedQueries:     map[string]bool{},
+		processedTracker:  common.NewTracker(),
+		stateStore:        newClientAggregationStore(config.SumAmount, config.TopSize),
+		publisher:         publisher,
 	}, nil
 }
 
@@ -84,7 +80,7 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 		return
 	}
 
-	if aggregation.queryAlredyReceived(innerMsg.ClientID, innerMsg.QueryID, innerMsg.Type, innerMsg.SumID) {
+	if aggregation.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), &innerMsg.SumID) {
 		return
 	}
 
@@ -104,36 +100,23 @@ func (aggregation *Aggregation) shouldProcessClient(clientID string) bool {
 	}
 
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(clientID))
-	targetID := int(h.Sum32() % uint32(aggregation.aggregationAmount))
-	return targetID == aggregation.id
+	h.Write([]byte(clientID))
+	targetAggregationID := int(h.Sum32() % uint32(aggregation.aggregationAmount))
+	return targetAggregationID == aggregation.id
 }
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(innerMsg *inner.InnerMessage) error {
 	slog.Info("Received End Of Records message")
 
-	if _, ok := aggregation.clientSumsCounter[innerMsg.ClientID]; !ok {
-		aggregation.clientSumsCounter[innerMsg.ClientID] = 0
-	}
-
-	aggregation.clientSumsCounter[innerMsg.ClientID] += 1
-
-	if aggregation.clientSumsCounter[innerMsg.ClientID] != aggregation.SumAmount {
-		slog.Info("Waiting for more SUM results before creating TOP", "clientID", innerMsg.ClientID, "currentSums", aggregation.clientSumsCounter[innerMsg.ClientID], "expectedSums", aggregation.SumAmount)
+	shouldBuildTop := aggregation.stateStore.RegisterEOF(innerMsg.ClientID)
+	if !shouldBuildTop {
+		slog.Info("Waiting for more SUM results before creating TOP", "clientID", innerMsg.ClientID)
 		return nil
 
 	}
 
-	fruitTopRecords := []fruititem.FruitItem{}
-	aggregation.buildFruitTop(innerMsg.ClientID, &fruitTopRecords)
-
-	message, err := inner.SerializeFruitItems(innerMsg.ClientID, innerMsg.QueryID+1, fruitTopRecords)
-	if err != nil {
-		slog.Debug("While serializing top message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending top message", "err", err)
+	fruitTopRecords := aggregation.stateStore.BuildTop(innerMsg.ClientID)
+	if err := aggregation.publisher.PublishTop(innerMsg.ClientID, innerMsg.QueryID+1, fruitTopRecords); err != nil {
 		return err
 	}
 
@@ -143,63 +126,10 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(innerMsg *inner.InnerM
 }
 
 func (aggregation *Aggregation) handleDataMessage(clientID string, fruitRecords []fruititem.FruitItem) {
-	if _, ok := aggregation.fruitItemMap[clientID]; !ok {
-		aggregation.fruitItemMap[clientID] = make(map[string]fruititem.FruitItem)
-		aggregation.clientSumsCounter[clientID] = 0
-	}
-
-	for _, fruitRecord := range fruitRecords {
-		if _, ok := aggregation.fruitItemMap[clientID][fruitRecord.Fruit]; ok {
-			aggregation.fruitItemMap[clientID][fruitRecord.Fruit] = aggregation.fruitItemMap[clientID][fruitRecord.Fruit].Sum(fruitRecord)
-		} else {
-			aggregation.fruitItemMap[clientID][fruitRecord.Fruit] = fruitRecord
-		}
-	}
-}
-
-func (aggregation *Aggregation) buildFruitTop(clientID string, fruitTopRecords *[]fruititem.FruitItem) {
-	clientFruitMap, ok := aggregation.fruitItemMap[clientID]
-	if !ok {
-		slog.Info("No records received for client; publishing empty TOP", "clientID", clientID)
-		*fruitTopRecords = []fruititem.FruitItem{}
-		return
-	}
-
-	slog.Info("Creating Fruit TOP")
-	fruitItems := make([]fruititem.FruitItem, 0, len(clientFruitMap))
-	for _, item := range clientFruitMap {
-		fruitItems = append(fruitItems, item)
-	}
-	sort.SliceStable(fruitItems, func(i, j int) bool {
-		return fruitItems[j].Less(fruitItems[i])
-	})
-	// NOTE: Esto probablemente seria mas eficiente usando un algoritmo Top K
-	finalTopSize := min(aggregation.topSize, len(fruitItems))
-	*fruitTopRecords = fruitItems[:finalTopSize]
-}
-
-func (aggregation *Aggregation) queryAlredyReceived(clientID string, queryID uint32, msgType inner.MsgType, sumID int) bool {
-	queryKey := fmt.Sprintf("%s_%d_%s_%d", clientID, queryID, msgType, sumID)
-
-	// Si la query ya fue recibida antes, no la vuelvo a procesar
-	// Esto evita retransmiciones de RabbitMQ
-	if _, ok := aggregation.solvedQueries[queryKey]; ok {
-		return true
-	} else {
-		aggregation.solvedQueries[queryKey] = true
-	}
-
-	return false
+	aggregation.stateStore.Add(clientID, fruitRecords)
 }
 
 func (aggregation *Aggregation) clearClientState(clientID string) {
-	delete(aggregation.fruitItemMap, clientID)
-	delete(aggregation.clientSumsCounter, clientID)
-
-	prefix := fmt.Sprintf("%s_", clientID)
-	for key := range aggregation.solvedQueries {
-		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
-			delete(aggregation.solvedQueries, key)
-		}
-	}
+	aggregation.stateStore.Clear(clientID)
+	aggregation.processedTracker.DeleteByClient(clientID)
 }

@@ -1,7 +1,6 @@
 package join
 
 import (
-	"fmt"
 	"log/slog"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common"
@@ -22,13 +21,12 @@ type JoinConfig struct {
 }
 
 type Join struct {
-	inputQueue        middleware.Middleware
-	outputQueue       middleware.Middleware
-	sumInputQueue     middleware.Middleware
-	sumOutputExchange middleware.Middleware
-	queriesProcessed  map[string]map[uint32]struct{}
-	clientsWaiting    map[string]uint32
-	processedMessages map[string]struct{}
+	inputQueue       middleware.Middleware
+	outputQueue      middleware.Middleware
+	sumInputQueue    middleware.Middleware
+	processedTracker *common.Tracker
+	stateStore       *clientQueryStore
+	publisher        *joinPublisher
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -60,14 +58,15 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
+	publisher := newJoinPublisher(sumOutputExchange)
+
 	result := &Join{
-		inputQueue:        inputQueue,
-		outputQueue:       outputQueue,
-		sumInputQueue:     sumInputQueue,
-		sumOutputExchange: sumOutputExchange,
-		queriesProcessed:  make(map[string]map[uint32]struct{}),
-		clientsWaiting:    make(map[string]uint32),
-		processedMessages: make(map[string]struct{}),
+		inputQueue:       inputQueue,
+		outputQueue:      outputQueue,
+		sumInputQueue:    sumInputQueue,
+		processedTracker: common.NewTracker(),
+		stateStore:       newClientQueryStore(),
+		publisher:        publisher,
 	}
 
 	return result, nil
@@ -108,7 +107,7 @@ func (join *Join) handleSumQueries(msg middleware.Message, ack func(), nack func
 		return
 	}
 
-	if join.sumMessageAlreadyProcessed(innerMsg.ClientID, innerMsg.QueryID, innerMsg.Type) {
+	if join.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), nil) {
 		return
 	}
 
@@ -121,17 +120,9 @@ func (join *Join) handleSumQueries(msg middleware.Message, ack func(), nack func
 }
 
 func (join *Join) handleSumProcessedQuery(innerMsg *inner.InnerMessage) {
-	if _, ok := join.queriesProcessed[innerMsg.ClientID]; !ok {
-		join.queriesProcessed[innerMsg.ClientID] = make(map[uint32]struct{})
-	}
-	join.queriesProcessed[innerMsg.ClientID][innerMsg.QueryID] = struct{}{}
-
-	// Si ya se recibio el mensaje de EOF del cliente y con esta query se procesaron
-	// todas las del cliente entonces hay que hacerle flush a sus datos
-	if processedQueries, ok := join.clientsWaiting[innerMsg.ClientID]; ok && len(join.queriesProcessed[innerMsg.ClientID]) == int(processedQueries) {
-		// Publish using the EOF query id (last processed query id + 1),
-		// independent from the order in which SUM and EOF messages arrive.
-		if err := join.publishSafeToFlush(innerMsg.ClientID, processedQueries+1); err != nil {
+	flushQueryID, shouldFlush := join.stateStore.RegisterQuery(innerMsg.ClientID, innerMsg.QueryID)
+	if shouldFlush {
+		if err := join.publisher.PublishSafeToFlush(innerMsg.ClientID, flushQueryID); err != nil {
 			slog.Error("While publishing safe to flush message", "err", err)
 			return
 		}
@@ -139,64 +130,19 @@ func (join *Join) handleSumProcessedQuery(innerMsg *inner.InnerMessage) {
 }
 
 func (join *Join) handleEndOfRecordsFromSum(innerMsg *inner.InnerMessage) {
-	if innerMsg.QueryID == common.ClientQueryCounterStartValue {
+	flushQueryID, shouldFlush, emptyClient := join.stateStore.RegisterEOF(innerMsg.ClientID, innerMsg.QueryID)
+	if emptyClient {
 		slog.Info("Client send EOF without sending any records")
-		if err := join.publishSafeToFlush(innerMsg.ClientID, innerMsg.QueryID); err != nil {
-			slog.Error("While publishing safe to flush message", "err", err)
-			return
-		}
-		return
 	}
-
-	lastFruitQuery := innerMsg.QueryID - 1
-	join.clientsWaiting[innerMsg.ClientID] = lastFruitQuery
-
-	clientProcessedQueries, ok := join.queriesProcessed[innerMsg.ClientID]
-	if !ok {
-		// Puede ser que llego el EOF de un cliente antes que otros mensajes del mismo
-		return
-	}
-
-	if len(clientProcessedQueries) == int(lastFruitQuery) {
-		if err := join.publishSafeToFlush(innerMsg.ClientID, innerMsg.QueryID); err != nil {
+	if shouldFlush {
+		if err := join.publisher.PublishSafeToFlush(innerMsg.ClientID, flushQueryID); err != nil {
 			slog.Error("While publishing safe to flush message", "err", err)
 			return
 		}
 	}
-}
-
-func (join *Join) publishSafeToFlush(clientID string, queryID uint32) error {
-	msg, err := inner.SerializeSafeToFlush(clientID, queryID)
-	if err != nil {
-		return err
-	}
-
-	if err := join.sumOutputExchange.Send(*msg); err != nil {
-		return err
-	}
-
-	// join.clearClientState(clientID)
-	return nil
-}
-
-func (join *Join) sumMessageAlreadyProcessed(clientID string, queryID uint32, msgType inner.MsgType) bool {
-	key := fmt.Sprintf("%s_%d_%s", clientID, queryID, msgType)
-	if _, ok := join.processedMessages[key]; ok {
-		return true
-	}
-
-	join.processedMessages[key] = struct{}{}
-	return false
 }
 
 func (join *Join) clearClientState(clientID string) {
-	delete(join.queriesProcessed, clientID)
-	delete(join.clientsWaiting, clientID)
-
-	prefix := fmt.Sprintf("%s_", clientID)
-	for key := range join.processedMessages {
-		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
-			delete(join.processedMessages, key)
-		}
-	}
+	join.stateStore.Clear(clientID)
+	join.processedTracker.DeleteByClient(clientID)
 }

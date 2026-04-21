@@ -30,15 +30,44 @@ type InnerMessage struct {
 	Type     MsgType  `json:"type"`
 }
 
-func SerializeFruitItems(clientID string, queryID uint32, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	records := createRecords(fruitRecords)
-
-	msg := InnerMessage{
+func NewInnerMessage(clientID string, queryID uint32, msgType MsgType, sumID *int, records []fruititem.FruitItem) *InnerMessage {
+	msg := &InnerMessage{
 		QueryID:  queryID,
 		ClientID: clientID,
-		Records:  records,
-		Type:     FruitRecord,
+		Records:  createRecords(records),
+		Type:     msgType,
 	}
+
+	if sumID != nil {
+		msg.SumID = *sumID
+	}
+
+	return msg
+}
+
+func (m *InnerMessage) Validate() error {
+	switch m.Type {
+	case EndOfRecords, SafeToFlush, SumQueryProcessed:
+		if len(m.Records) > 0 {
+			return errors.New("control message should not contain records")
+		}
+	case FruitRecord:
+		if len(m.Records) == 0 {
+			return errors.New("fruit_record must contain records")
+		}
+	default:
+		return errors.New("unknown message type")
+	}
+
+	if m.ClientID == "" {
+		return errors.New("client_id is required")
+	}
+
+	return nil
+}
+
+func SerializeFruitItems(clientID string, queryID uint32, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+	msg := NewInnerMessage(clientID, queryID, FruitRecord, nil, fruitRecords)
 
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -49,15 +78,7 @@ func SerializeFruitItems(clientID string, queryID uint32, fruitRecords []fruitit
 }
 
 func SerializeFruitItemsFromSum(clientID string, queryID uint32, sumID int, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
-	records := createRecords(fruitRecords)
-
-	msg := InnerMessage{
-		QueryID:  queryID,
-		ClientID: clientID,
-		SumID:    sumID,
-		Records:  records,
-		Type:     FruitRecord,
-	}
+	msg := NewInnerMessage(clientID, queryID, FruitRecord, &sumID, fruitRecords)
 
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -68,12 +89,7 @@ func SerializeFruitItemsFromSum(clientID string, queryID uint32, sumID int, frui
 }
 
 func SerializeEOF(clientID string, queryID uint32) (*middleware.Message, error) {
-	msg := InnerMessage{
-		QueryID:  queryID,
-		ClientID: clientID,
-		Records:  []Record{},
-		Type:     EndOfRecords,
-	}
+	msg := NewInnerMessage(clientID, queryID, EndOfRecords, nil, []fruititem.FruitItem{})
 
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -84,13 +100,7 @@ func SerializeEOF(clientID string, queryID uint32) (*middleware.Message, error) 
 }
 
 func SerializeEOFFromSum(clientID string, queryID uint32, sumID int) (*middleware.Message, error) {
-	msg := InnerMessage{
-		QueryID:  queryID,
-		ClientID: clientID,
-		SumID:    sumID,
-		Records:  []Record{},
-		Type:     EndOfRecords,
-	}
+	msg := NewInnerMessage(clientID, queryID, EndOfRecords, &sumID, []fruititem.FruitItem{})
 
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -101,12 +111,7 @@ func SerializeEOFFromSum(clientID string, queryID uint32, sumID int) (*middlewar
 }
 
 func SerializeQueryProcessed(clientID string, queryID uint32) (*middleware.Message, error) {
-	msg := InnerMessage{
-		QueryID:  queryID,
-		ClientID: clientID,
-		Records:  []Record{},
-		Type:     SumQueryProcessed,
-	}
+	msg := NewInnerMessage(clientID, queryID, SumQueryProcessed, nil, []fruititem.FruitItem{})
 
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -117,12 +122,7 @@ func SerializeQueryProcessed(clientID string, queryID uint32) (*middleware.Messa
 }
 
 func SerializeSafeToFlush(clientID string, queryID uint32) (*middleware.Message, error) {
-	msg := InnerMessage{
-		QueryID:  queryID,
-		ClientID: clientID,
-		Records:  []Record{},
-		Type:     SafeToFlush,
-	}
+	msg := NewInnerMessage(clientID, queryID, SafeToFlush, nil, []fruititem.FruitItem{})
 
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -139,8 +139,8 @@ func DeserializeMessage(message *middleware.Message) (*InnerMessage, error) {
 		return nil, err
 	}
 
-	if msg.Type == EndOfRecords && len(msg.Records) > 0 {
-		return nil, errors.New("EOF message should not contain records")
+	if err := msg.Validate(); err != nil {
+		return nil, err
 	}
 
 	return &msg, nil
