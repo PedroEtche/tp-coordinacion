@@ -14,6 +14,8 @@ func NewTracker() *Tracker {
 	return &Tracker{}
 }
 
+// Load checks if the message has already been processed. If not, it marks it as processed and returns false
+// If it has already been processed, it returns true.
 func (tracker *Tracker) Load(clientID string, queryID uint32, msgType string, sourceID *int) bool {
 	key := BuildMessageKey(clientID, queryID, msgType, sourceID)
 	_, alreadyLoaded := tracker.processed.LoadOrStore(key, struct{}{})
