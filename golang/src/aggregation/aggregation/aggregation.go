@@ -53,7 +53,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		return nil, err
 	}
 
-	publisher := newAggregationPublisher(outputQueue)
+	publisher := newAggregationPublisher(config.Id, outputQueue)
 
 	return &Aggregation{
 		inputExchange:     inputExchange,
@@ -93,18 +93,19 @@ func (aggregation *Aggregation) handleSignals(done chan struct{}) {
 // -----------------------------------------------------------------------------
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
+	defer ack()
 	innerMsg, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
-	defer ack()
 
-	if !aggregation.shouldProcessClient(innerMsg.ClientID) {
+	if !aggregation.shouldProcessClient(innerMsg) {
 		return
 	}
 
-	if aggregation.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), &innerMsg.SumID) {
+	if aggregation.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), &innerMsg.NodeID) {
+		slog.Info("Desecho el mensaje", "clientID", "type", innerMsg.ClientID, innerMsg.Type)
 		return
 	}
 
@@ -118,13 +119,14 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	}
 }
 
-func (aggregation *Aggregation) shouldProcessClient(clientID string) bool {
-	if aggregation.aggregationAmount <= 1 {
+func (aggregation *Aggregation) shouldProcessClient(innerMsg *inner.InnerMessage) bool {
+	if aggregation.aggregationAmount <= 1 || innerMsg.Type == inner.EndOfRecords {
 		return true
 	}
 
 	h := fnv.New32a()
-	h.Write([]byte(clientID))
+	query := fmt.Sprintf("%d_%s", innerMsg.QueryID, innerMsg.ClientID)
+	h.Write([]byte(query))
 	targetAggregationID := int(h.Sum32() % uint32(aggregation.aggregationAmount))
 	return targetAggregationID == aggregation.id
 }
@@ -136,13 +138,14 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(innerMsg *inner.InnerM
 	if !shouldBuildTop {
 		slog.Info("Waiting for more SUM results before creating TOP", "clientID", innerMsg.ClientID)
 		return nil
-
 	}
 
 	fruitTopRecords := aggregation.stateStore.BuildTop(innerMsg.ClientID)
-	if err := aggregation.publisher.PublishTop(innerMsg.ClientID, innerMsg.QueryID+1, fruitTopRecords); err != nil {
+	if err := aggregation.publisher.PublishTop(innerMsg.ClientID, innerMsg.QueryID, fruitTopRecords); err != nil {
+		slog.Error("Publish top", "clientID", "records", innerMsg.ClientID, fruitTopRecords)
 		return err
 	}
+	slog.Info("Publish top", "clientID", "records", innerMsg.ClientID, fruitTopRecords)
 
 	aggregation.clearClientState(innerMsg.ClientID)
 

@@ -25,12 +25,12 @@ type JoinConfig struct {
 }
 
 type Join struct {
-	inputQueue       middleware.Middleware
-	outputQueue      middleware.Middleware
-	sumInputQueue    middleware.Middleware
-	processedTracker *common.Tracker
-	stateStore       *clientQueryStore
-	publisher        *joinPublisher
+	inputQueue                 middleware.Middleware
+	sumInputQueue              middleware.Middleware
+	sumProcessedTracker        *common.Tracker
+	aggregatorProcessedTracker *common.Tracker
+	stateStore                 *queryStore
+	publisher                  *joinPublisher
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -71,15 +71,15 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		sumOutputQueues = append(sumOutputQueues, sumOutputQueue)
 	}
 
-	publisher := newJoinPublisher(sumOutputQueues)
+	publisher := newJoinPublisher(sumOutputQueues, outputQueue)
 
 	result := &Join{
-		inputQueue:       inputQueue,
-		outputQueue:      outputQueue,
-		sumInputQueue:    sumInputQueue,
-		processedTracker: common.NewTracker(),
-		stateStore:       newClientQueryStore(),
-		publisher:        publisher,
+		inputQueue:                 inputQueue,
+		sumInputQueue:              sumInputQueue,
+		sumProcessedTracker:        common.NewTracker(),
+		aggregatorProcessedTracker: common.NewTracker(),
+		stateStore:                 newClientQueryStore(config.AggregationAmount, config.TopSize),
+		publisher:                  publisher,
 	}
 
 	return result, nil
@@ -108,7 +108,6 @@ func (join *Join) handleSignals(done chan struct{}) {
 	slog.Info("SIGTERM signal received")
 
 	join.inputQueue.Close()
-	join.outputQueue.Close()
 	join.sumInputQueue.Close()
 	join.publisher.Close()
 
@@ -121,9 +120,43 @@ func (join *Join) handleSignals(done chan struct{}) {
 
 func (join *Join) handleInputQueue(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
-	if err := join.outputQueue.Send(msg); err != nil {
-		slog.Error("While sending top", "err", err)
+	innerMsg, err := inner.DeserializeMessage(&msg)
+	if err != nil {
+		slog.Error("While deserializing message", "err", err)
+		return
 	}
+
+	if join.aggregatorProcessedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), &innerMsg.NodeID) {
+		return
+	}
+
+	if innerMsg.Type == inner.FruitRecord {
+		join.handleTopMessage(innerMsg)
+		return
+	}
+	slog.Error("Unknown message type", "type", innerMsg.Type)
+}
+
+func (join *Join) handleTopMessage(innerMsg *inner.InnerMessage) error {
+	slog.Info("Received partial top message")
+
+	join.stateStore.AddPartialTop(innerMsg.ClientID, innerMsg.ToFruitItems())
+
+	if !join.stateStore.RegisterAggregationEOF(innerMsg.ClientID, innerMsg.NodeID) {
+		slog.Info("Waiting for more Aggregators data before flushing", "clientID", innerMsg.ClientID)
+		return nil
+
+	}
+
+	fruitTopRecords := join.stateStore.BuildTop(innerMsg.ClientID)
+	if err := join.publisher.PublishTop(innerMsg.ClientID, innerMsg.QueryID+1, fruitTopRecords); err != nil {
+		return err
+	}
+	slog.Info("Publish top", "clientID", "records", innerMsg.ClientID, fruitTopRecords)
+
+	join.clearClientState(innerMsg.ClientID)
+
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -138,7 +171,7 @@ func (join *Join) handleSumQueries(msg middleware.Message, ack func(), nack func
 		return
 	}
 
-	if join.processedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), nil) {
+	if join.sumProcessedTracker.Load(innerMsg.ClientID, innerMsg.QueryID, string(innerMsg.Type), nil) {
 		return
 	}
 
@@ -171,8 +204,12 @@ func (join *Join) handleEndOfRecordsFromSum(innerMsg *inner.InnerMessage) {
 			return
 		}
 
-		join.clearClientState(innerMsg.ClientID)
+		join.clearClientSumState(innerMsg.ClientID)
 	}
+}
+
+func (join *Join) clearClientSumState(clientID string) {
+	join.stateStore.ClearSumCoordination(clientID)
 }
 
 func (join *Join) clearClientState(clientID string) {

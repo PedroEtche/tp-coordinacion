@@ -48,7 +48,7 @@ func (publisher *sumPublisher) PublishClientEOFAnnouncement(clientID string, que
 }
 
 func (publisher *sumPublisher) PublishFruitItems(clientID string, queryID uint32, fruitItems []fruititem.FruitItem) error {
-	message, err := inner.SerializeFruitItemsFromSum(clientID, queryID, publisher.sumID, fruitItems)
+	message, err := inner.SerializeFruitItemsWithID(clientID, queryID, publisher.sumID, fruitItems)
 	if err != nil {
 		slog.Debug("While serializing message", "err", err)
 		return err
@@ -61,7 +61,7 @@ func (publisher *sumPublisher) PublishFruitItems(clientID string, queryID uint32
 }
 
 func (publisher *sumPublisher) PublishEOF(clientID string, queryID uint32) error {
-	message, err := inner.SerializeEOFFromSum(clientID, queryID, publisher.sumID)
+	message, err := inner.SerializeEOFWithID(clientID, queryID, publisher.sumID)
 	if err != nil {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err

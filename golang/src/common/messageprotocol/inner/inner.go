@@ -25,7 +25,7 @@ type Record struct {
 type InnerMessage struct {
 	QueryID  uint32   `json:"query_id"`
 	ClientID string   `json:"client_id"`
-	SumID    int      `json:"sum_id,omitempty"`
+	NodeID   int      `json:"sum_id,omitempty"`
 	Records  []Record `json:"records"`
 	Type     MsgType  `json:"type"`
 }
@@ -39,7 +39,7 @@ func NewInnerMessage(clientID string, queryID uint32, msgType MsgType, sumID *in
 	}
 
 	if sumID != nil {
-		msg.SumID = *sumID
+		msg.NodeID = *sumID
 	}
 
 	return msg
@@ -52,9 +52,8 @@ func (m *InnerMessage) Validate() error {
 			return errors.New("control message should not contain records")
 		}
 	case FruitRecord:
-		if len(m.Records) == 0 {
-			return errors.New("fruit_record must contain records")
-		}
+	// No hay validaciones por el momento
+
 	default:
 		return errors.New("unknown message type")
 	}
@@ -77,7 +76,7 @@ func SerializeFruitItems(clientID string, queryID uint32, fruitRecords []fruitit
 	return &middleware.Message{Body: string(body)}, nil
 }
 
-func SerializeFruitItemsFromSum(clientID string, queryID uint32, sumID int, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
+func SerializeFruitItemsWithID(clientID string, queryID uint32, sumID int, fruitRecords []fruititem.FruitItem) (*middleware.Message, error) {
 	msg := NewInnerMessage(clientID, queryID, FruitRecord, &sumID, fruitRecords)
 
 	body, err := json.Marshal(msg)
@@ -99,7 +98,7 @@ func SerializeEOF(clientID string, queryID uint32) (*middleware.Message, error) 
 	return &middleware.Message{Body: string(body)}, nil
 }
 
-func SerializeEOFFromSum(clientID string, queryID uint32, sumID int) (*middleware.Message, error) {
+func SerializeEOFWithID(clientID string, queryID uint32, sumID int) (*middleware.Message, error) {
 	msg := NewInnerMessage(clientID, queryID, EndOfRecords, &sumID, []fruititem.FruitItem{})
 
 	body, err := json.Marshal(msg)
