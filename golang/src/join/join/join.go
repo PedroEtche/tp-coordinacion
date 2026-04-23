@@ -131,7 +131,7 @@ func (join *Join) handleInputQueue(msg middleware.Message, ack func(), nack func
 // -----------------------------------------------------------------------------
 
 func (join *Join) handleSumQueries(msg middleware.Message, ack func(), nack func()) {
-	defer ack() // TODO: Chequear cuando habria que mandar el ack a Rabbit o si tendria que usar nack
+	defer ack()
 	innerMsg, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)

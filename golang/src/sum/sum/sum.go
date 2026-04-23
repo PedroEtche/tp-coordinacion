@@ -114,7 +114,7 @@ func (sum *Sum) startClientInputListener() {
 }
 
 func (sum *Sum) handleClientInputMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack() // TODO: Chequear cuando habria que mandar el ack a Rabbit o si tendria que usar nack
+	defer ack()
 	innerMsg, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
@@ -153,7 +153,7 @@ func (sum *Sum) startEofCoordinationListener() {
 }
 
 func (sum *Sum) handleEofCoordinationMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack() // TODO: Chequear cuando habria que mandar el ack a Rabbit
+	defer ack()
 	innerMsg, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
