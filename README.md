@@ -79,3 +79,19 @@ Al momento de la evaluación y ejecución de las pruebas se **descartarán** o *
 - La implementación del protocolo de comunicación externo y `FruitItem`.
 
 Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.
+
+
+# Informe
+
+
+
+![](./imgs/image.png "Diagragrama de Robustez planteado")
+
+Los cambios que introduje son los siguientes:
+- Para manejar multiples clientes se le asigna un uuid a cada uno. El mismo se genera en el message handler. Ademas, se le asigna un numero incremental a cada query que hagan
+- Para manejar multiples sum use la misma cola para el balanceo de carga. Lo que cambie es que cada vez que se procesa una query del cliente el ID de la misma se pasa al JOIN. Cuando llegue entonces el query de EOF de un cliente a cualquier SUM lo unico que va a hacer el nodo el pasarle el mensaje a JOIN. Como todas la queries de un cliente estan numeradas, el JOIN sabe cuantas queries mando un cliente antes del EOF. El Join ahora solo espera de tener todos los ids de las queries procesadas del cliente que mando el EOF. Una vez que tenga todo le manda un mensaje de safe to flush a todos los SUMs.
+  - Aca detecte una mejora sustancial que intente implementar pero no logre hacer funcionar sin race conditions. En vez de que un SUM mande uno por uno los IDs de las queries procesadas, deberia mandar un bache. Esto ahorria bastantes mensajes y probablemente acelelaria el proceso ya que se reduciria la latencia de la red
+- Para manejar varios Aggregators mantuve el exchange que se declaraba. Ahora cada entidad hace un hash de id del cliente y le hace un modulo de la cantidad de Aggregators que hay en el sistema. 
+  - Aca tambien detecte una mejora. Se podria hacer que las queries de un cliente esten repartidas entre varios Aggregators y que luego JOIN se encargue de fucionar los tops parciales. Eso aceleraria bastante el proceso. Llegue a tener una implementacion casi completa de esta solucion, pero estaba teniendo race conditions que no logre dilucidar el por que. Si hubiese tenido mas tiempo hubiese hecho una implementacion muy similar a la de SUM (usar una queue en vez de un excahge) y que JOIN se encargue de coordinar.
+
+Con la implementacion actual el sistema escala mucho en cuanto a la cantidad de clientes que pueden ser atendidos. Ahora el trabajo se reparte de forma uniforme entre los SUMs. Los Aggregators tienen el margen de mejora antes explicado, pero igualmente se ve una mejora sustancial frente al caso en el que haya un solo Aggregator. Sobre todo si se aumenta la cantidad de computo que deberian hacer, ya que se vera repartida de cierta forma. De vuelta, podria ser repartida de forma mas uniforme, pero igualmente hay una mejora frente al caso de un solo Aggregator  
