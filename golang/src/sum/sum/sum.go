@@ -183,7 +183,12 @@ func (sum *Sum) flushClientDataOnEof(clientID string, queryID uint32) error {
 
 	if !ok {
 		slog.Info("No records received for client", "clientID", clientID)
-		return sum.publisher.PublishEOF(clientID, queryID)
+		if err := sum.publisher.PublishEOF(clientID, queryID); err != nil {
+			return err
+		}
+
+		sum.clearClientState(clientID)
+		return nil
 	}
 
 	if err := sum.publisher.PublishFruitItems(clientID, queryID, fruitItems); err != nil {
@@ -194,6 +199,8 @@ func (sum *Sum) flushClientDataOnEof(clientID string, queryID uint32) error {
 		return err
 	}
 
+	sum.clearClientState(clientID)
+
 	return nil
 }
 
@@ -203,5 +210,4 @@ func (sum *Sum) flushClientDataOnEof(clientID string, queryID uint32) error {
 
 func (sum *Sum) clearClientState(clientID string) {
 	sum.store.Clear(clientID)
-	sum.processedTracker.DeleteByClient(clientID)
 }

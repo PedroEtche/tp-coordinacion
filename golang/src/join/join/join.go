@@ -170,10 +170,11 @@ func (join *Join) handleEndOfRecordsFromSum(innerMsg *inner.InnerMessage) {
 			slog.Error("While publishing safe to flush message", "err", err)
 			return
 		}
+
+		join.clearClientState(innerMsg.ClientID)
 	}
 }
 
 func (join *Join) clearClientState(clientID string) {
 	join.stateStore.Clear(clientID)
-	join.processedTracker.DeleteByClient(clientID)
 }

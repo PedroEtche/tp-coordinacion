@@ -144,7 +144,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(innerMsg *inner.InnerM
 		return err
 	}
 
-	// aggregation.clearClientState(innerMsg.ClientID)
+	aggregation.clearClientState(innerMsg.ClientID)
 
 	return nil
 }
@@ -155,5 +155,4 @@ func (aggregation *Aggregation) handleDataMessage(clientID string, fruitRecords 
 
 func (aggregation *Aggregation) clearClientState(clientID string) {
 	aggregation.stateStore.Clear(clientID)
-	aggregation.processedTracker.DeleteByClient(clientID)
 }
