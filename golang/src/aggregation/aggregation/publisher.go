@@ -28,3 +28,7 @@ func (publisher *aggregationPublisher) PublishTop(clientID string, queryID uint3
 	}
 	return nil
 }
+
+func (publisher *aggregationPublisher) Close() {
+	publisher.outputQueue.Close()
+}

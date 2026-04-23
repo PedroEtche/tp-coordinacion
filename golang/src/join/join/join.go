@@ -1,7 +1,11 @@
 package join
 
 import (
+	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -50,15 +54,24 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	sumOutputExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, common.ExchangeKey, connSettings)
-	if err != nil {
-		inputQueue.Close()
-		outputQueue.Close()
-		sumInputQueue.Close()
-		return nil, err
+	sumOutputQueues := make([]middleware.Middleware, 0, config.SumAmount)
+	for i := range config.SumAmount {
+		sumQueueName := fmt.Sprintf("%s_%d", config.SumPrefix, i)
+		sumOutputQueue, queueErr := middleware.CreateQueueMiddleware(sumQueueName, connSettings)
+		if queueErr != nil {
+			inputQueue.Close()
+			outputQueue.Close()
+			sumInputQueue.Close()
+			for _, q := range sumOutputQueues {
+				q.Close()
+			}
+			return nil, queueErr
+		}
+
+		sumOutputQueues = append(sumOutputQueues, sumOutputQueue)
 	}
 
-	publisher := newJoinPublisher(sumOutputExchange)
+	publisher := newJoinPublisher(sumOutputQueues)
 
 	result := &Join{
 		inputQueue:       inputQueue,
@@ -73,6 +86,9 @@ func NewJoin(config JoinConfig) (*Join, error) {
 }
 
 func (join *Join) Run() {
+	done := make(chan struct{})
+	go join.handleSignals(done)
+
 	go join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		join.handleInputQueue(msg, ack, nack)
 	})
@@ -81,7 +97,22 @@ func (join *Join) Run() {
 		join.handleSumQueries(msg, ack, nack)
 	})
 
-	select {} // TODO: Meter un sigterm
+	<-done // bloquea hasta SIGTERM/SIGINT
+}
+
+func (join *Join) handleSignals(done chan struct{}) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	<-signals
+	slog.Info("SIGTERM signal received")
+
+	join.inputQueue.Close()
+	join.outputQueue.Close()
+	join.sumInputQueue.Close()
+	join.publisher.Close()
+
+	close(done)
 }
 
 // -----------------------------------------------------------------------------

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
@@ -63,10 +66,31 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 }
 
 func (aggregation *Aggregation) Run() {
-	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	done := make(chan struct{})
+	go aggregation.handleSignals(done)
+
+	go aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
+
+	<-done // bloquea hasta SIGTERM/SIGINT
 }
+
+func (aggregation *Aggregation) handleSignals(done chan struct{}) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	<-signals
+	slog.Info("SIGTERM signal received")
+
+	aggregation.inputExchange.Close()
+	aggregation.publisher.Close()
+	close(done)
+}
+
+// -----------------------------------------------------------------------------
+// INPUT QUEUE FLOW
+// -----------------------------------------------------------------------------
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	innerMsg, err := inner.DeserializeMessage(&msg)

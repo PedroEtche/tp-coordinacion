@@ -72,3 +72,8 @@ func (publisher *sumPublisher) PublishEOF(clientID string, queryID uint32) error
 	}
 	return nil
 }
+
+func (publisher *sumPublisher) Close() {
+	publisher.joinOutputQueue.Close()
+	publisher.aggregationExchange.Close()
+}

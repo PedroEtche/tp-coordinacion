@@ -6,11 +6,11 @@ import (
 )
 
 type joinPublisher struct {
-	sumOutputExchange middleware.Middleware
+	sumOutputQueues []middleware.Middleware
 }
 
-func newJoinPublisher(sumOutputExchange middleware.Middleware) *joinPublisher {
-	return &joinPublisher{sumOutputExchange: sumOutputExchange}
+func newJoinPublisher(sumOutputQueues []middleware.Middleware) *joinPublisher {
+	return &joinPublisher{sumOutputQueues: sumOutputQueues}
 }
 
 func (publisher *joinPublisher) PublishSafeToFlush(clientID string, queryID uint32) error {
@@ -19,9 +19,17 @@ func (publisher *joinPublisher) PublishSafeToFlush(clientID string, queryID uint
 		return err
 	}
 
-	if err := publisher.sumOutputExchange.Send(*msg); err != nil {
-		return err
+	for _, queue := range publisher.sumOutputQueues {
+		if err := queue.Send(*msg); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+func (publisher *joinPublisher) Close() {
+	for _, queue := range publisher.sumOutputQueues {
+		queue.Close()
+	}
 }

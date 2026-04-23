@@ -3,6 +3,9 @@ package sum
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -21,12 +24,12 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	Id                int
-	inputQueue        middleware.Middleware
-	joinInputExchange middleware.Middleware
-	processedTracker  *common.Tracker
-	store             *clientFruitStore
-	publisher         *sumPublisher
+	Id               int
+	inputQueue       middleware.Middleware
+	joinInputQueue   middleware.Middleware
+	processedTracker *common.Tracker
+	store            *clientFruitStore
+	publisher        *sumPublisher
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -55,7 +58,8 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	joinInputExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, common.ExchangeKey, connSettings)
+	joinInputQueueName := fmt.Sprintf("%s_%d", config.SumPrefix, config.Id)
+	joinInputExchange, err := middleware.CreateQueueMiddleware(joinInputQueueName, connSettings)
 	if err != nil {
 		inputQueue.Close()
 		outputExchange.Close()
@@ -66,20 +70,37 @@ func NewSum(config SumConfig) (*Sum, error) {
 	publisher := newSumPublisher(config.Id, joinOutoutQueue, outputExchange)
 
 	return &Sum{
-		Id:                config.Id,
-		inputQueue:        inputQueue,
-		joinInputExchange: joinInputExchange,
-		processedTracker:  common.NewTracker(),
-		store:             newClientFruitStore(),
-		publisher:         publisher,
+		Id:               config.Id,
+		inputQueue:       inputQueue,
+		joinInputQueue:   joinInputExchange,
+		processedTracker: common.NewTracker(),
+		store:            newClientFruitStore(),
+		publisher:        publisher,
 	}, nil
 }
 
 func (sum *Sum) Run() {
+	done := make(chan struct{})
+
+	go sum.handleSignals(done)
 	go sum.startClientInputListener()
 	go sum.startEofCoordinationListener()
 
-	select {} // TODO: Agregar control de sigterm para que se termine el proceso y se liberen los recursos
+	<-done // bloquea hasta SIGTERM/SIGINT
+}
+
+func (sum *Sum) handleSignals(done chan struct{}) {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	<-signals
+	slog.Info("SIGTERM signal received")
+
+	sum.inputQueue.Close()
+	sum.joinInputQueue.Close()
+	sum.publisher.Close()
+
+	close(done)
 }
 
 // -----------------------------------------------------------------------------
@@ -126,7 +147,7 @@ func (sum *Sum) handleDataMessage(innerMsg *inner.InnerMessage) error {
 // -----------------------------------------------------------------------------
 
 func (sum *Sum) startEofCoordinationListener() {
-	sum.joinInputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	sum.joinInputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleEofCoordinationMessage(msg, ack, nack)
 	})
 }
